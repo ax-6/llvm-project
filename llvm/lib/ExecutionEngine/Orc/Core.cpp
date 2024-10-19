@@ -87,13 +87,13 @@ FailedToMaterialize::FailedToMaterialize(
 
   // FIXME: Use a new dep-map type for FailedToMaterialize errors so that we
   // don't have to manually retain/release.
-  for (auto &KV : *this->Symbols)
-    KV.first->Retain();
+  for (auto &[JD, Syms] : *this->Symbols)
+    JD->Retain();
 }
 
 FailedToMaterialize::~FailedToMaterialize() {
-  for (auto &KV : *Symbols)
-    KV.first->Release();
+  for (auto &[JD, Syms] : *Symbols)
+    JD->Release();
 }
 
 std::error_code FailedToMaterialize::convertToErrorCode() const {
@@ -187,8 +187,8 @@ AsynchronousSymbolQuery::AsynchronousSymbolQuery(
 
   OutstandingSymbolsCount = Symbols.size();
 
-  for (auto &KV : Symbols)
-    ResolvedSymbols[KV.first] = ExecutorSymbolDef();
+  for (auto &[Name, Flags] : Symbols)
+    ResolvedSymbols[Name] = ExecutorSymbolDef();
 }
 
 void AsynchronousSymbolQuery::notifySymbolMetRequiredState(
@@ -271,8 +271,8 @@ void AsynchronousSymbolQuery::dropSymbol(const SymbolStringPtr &Name) {
 void AsynchronousSymbolQuery::detach() {
   ResolvedSymbols.clear();
   OutstandingSymbolsCount = 0;
-  for (auto &KV : QueryRegistrations)
-    KV.first->detachQueryHelper(*this, KV.second);
+  for (auto &[JD, Syms] : QueryRegistrations)
+    JD->detachQueryHelper(*this, Syms);
   QueryRegistrations.clear();
 }
 
@@ -312,8 +312,8 @@ void AbsoluteSymbolsMaterializationUnit::discard(const JITDylib &JD,
 MaterializationUnit::Interface
 AbsoluteSymbolsMaterializationUnit::extractFlags(const SymbolMap &Symbols) {
   SymbolFlagsMap Flags;
-  for (const auto &KV : Symbols)
-    Flags[KV.first] = KV.second.getFlags();
+  for (const auto &[Name, Def] : Symbols)
+    Flags[Name] = Def.getFlags();
   return MaterializationUnit::Interface(std::move(Flags), nullptr);
 }
 
@@ -932,13 +932,21 @@ Error JITDylib::resolve(MaterializationResponsibility &MR,
           if (SymI->second.getFlags().hasError())
             SymbolsInErrorState.insert(KV.first);
           else {
-            auto Flags = KV.second.getFlags();
-            Flags &= ~JITSymbolFlags::Common;
-            assert(Flags ==
-                       (SymI->second.getFlags() & ~JITSymbolFlags::Common) &&
-                   "Resolved flags should match the declared flags");
+            if (SymI->second.getFlags() & JITSymbolFlags::Common) {
+              [[maybe_unused]] auto WeakOrCommon =
+                  JITSymbolFlags::Weak | JITSymbolFlags::Common;
+              assert((KV.second.getFlags() & WeakOrCommon) &&
+                     "Common symbols must be resolved as common or weak");
+              assert((KV.second.getFlags() & ~WeakOrCommon) ==
+                         (SymI->second.getFlags() & ~JITSymbolFlags::Common) &&
+                     "Resolving symbol with incorrect flags");
 
-            Worklist.push_back({SymI, {KV.second.getAddress(), Flags}});
+            } else
+              assert(KV.second.getFlags() == SymI->second.getFlags() &&
+                     "Resolved flags should match the declared flags");
+
+            Worklist.push_back(
+                {SymI, {KV.second.getAddress(), SymI->second.getFlags()}});
           }
         }
 
@@ -1000,6 +1008,17 @@ void JITDylib::unlinkMaterializationResponsibility(
     if (I->second.empty())
       TrackerMRs.erase(MR.RT.get());
   });
+}
+
+void JITDylib::shrinkMaterializationInfoMemory() {
+  // DenseMap::erase never shrinks its storage; use clear to heuristically free
+  // memory since we may have long-lived JDs after linking is done.
+
+  if (UnmaterializedInfos.empty())
+    UnmaterializedInfos.clear();
+
+  if (MaterializingInfos.empty())
+    MaterializingInfos.clear();
 }
 
 void JITDylib::setLinkOrder(JITDylibSearchOrder NewLinkOrder,
@@ -1111,6 +1130,8 @@ Error JITDylib::remove(const SymbolNameSet &Names) {
       auto SymI = SymbolMaterializerItrPair.first;
       Symbols.erase(SymI);
     }
+
+    shrinkMaterializationInfoMemory();
 
     return Error::success();
   });
@@ -1253,7 +1274,7 @@ JITDylib::JITDylib(ExecutionSession &ES, std::string Name)
 
 std::pair<JITDylib::AsynchronousSymbolQuerySet,
           std::shared_ptr<SymbolDependenceMap>>
-JITDylib::removeTracker(ResourceTracker &RT) {
+JITDylib::IL_removeTracker(ResourceTracker &RT) {
   // Note: Should be called under the session lock.
   assert(State != Closed && "JD is defunct");
 
@@ -1292,9 +1313,7 @@ JITDylib::removeTracker(ResourceTracker &RT) {
       SymbolsToFail.push_back(Sym);
   }
 
-  AsynchronousSymbolQuerySet QueriesToFail;
-  auto Result = ES.runSessionLocked(
-      [&]() { return ES.IL_failSymbols(*this, std::move(SymbolsToFail)); });
+  auto Result = ES.IL_failSymbols(*this, std::move(SymbolsToFail));
 
   // Removed symbols should be taken out of the table altogether.
   for (auto &Sym : SymbolsToRemove) {
@@ -1312,6 +1331,8 @@ JITDylib::removeTracker(ResourceTracker &RT) {
 
     Symbols.erase(I);
   }
+
+  shrinkMaterializationInfoMemory();
 
   return Result;
 }
@@ -2183,7 +2204,8 @@ Error ExecutionSession::removeResourceTracker(ResourceTracker &RT) {
   runSessionLocked([&] {
     CurrentResourceManagers = ResourceManagers;
     RT.makeDefunct();
-    std::tie(QueriesToFail, FailedSymbols) = RT.getJITDylib().removeTracker(RT);
+    std::tie(QueriesToFail, FailedSymbols) =
+        RT.getJITDylib().IL_removeTracker(RT);
   });
 
   Error Err = Error::success();
@@ -2675,6 +2697,8 @@ void ExecutionSession::OL_completeLookup(
             return true;
           });
 
+      JD.shrinkMaterializationInfoMemory();
+
       // Handle failure.
       if (Err) {
 
@@ -2883,9 +2907,16 @@ Error ExecutionSession::OL_notifyResolved(MaterializationResponsibility &MR,
            "Resolving symbol outside this responsibility set");
     assert(!I->second.hasMaterializationSideEffectsOnly() &&
            "Can't resolve materialization-side-effects-only symbol");
-    assert((KV.second.getFlags() & ~JITSymbolFlags::Common) ==
-               (I->second & ~JITSymbolFlags::Common) &&
-           "Resolving symbol with incorrect flags");
+    if (I->second & JITSymbolFlags::Common) {
+      auto WeakOrCommon = JITSymbolFlags::Weak | JITSymbolFlags::Common;
+      assert((KV.second.getFlags() & WeakOrCommon) &&
+             "Common symbols must be resolved as common or weak");
+      assert((KV.second.getFlags() & ~WeakOrCommon) ==
+                 (I->second & ~JITSymbolFlags::Common) &&
+             "Resolving symbol with incorrect flags");
+    } else
+      assert(KV.second.getFlags() == I->second &&
+             "Resolving symbol with incorrect flags");
   }
 #endif
 
@@ -3118,6 +3149,8 @@ void ExecutionSession::IL_makeEDUReady(
 
     JD.MaterializingInfos.erase(MII);
   }
+
+  JD.shrinkMaterializationInfoMemory();
 }
 
 void ExecutionSession::IL_makeEDUEmitted(
@@ -3574,6 +3607,21 @@ ExecutionSession::IL_failSymbols(JITDylib &JD,
       assert(MI.DefiningEDU->Symbols.count(NonOwningSymbolStringPtr(Name)) &&
              "Symbol does not appear in its DefiningEDU");
       MI.DefiningEDU->Symbols.erase(NonOwningSymbolStringPtr(Name));
+
+      // Remove this EDU from the dependants lists of its dependencies.
+      for (auto &[DepJD, DepSyms] : MI.DefiningEDU->Dependencies) {
+        for (auto DepSym : DepSyms) {
+          assert(DepJD->Symbols.count(SymbolStringPtr(DepSym)) &&
+                 "DepSym not in DepJD");
+          assert(DepJD->MaterializingInfos.count(SymbolStringPtr(DepSym)) &&
+                 "DepSym has not MaterializingInfo");
+          auto &SymMI = DepJD->MaterializingInfos[SymbolStringPtr(DepSym)];
+          assert(SymMI.DependantEDUs.count(MI.DefiningEDU.get()) &&
+                 "DefiningEDU missing from DependantEDUs list of dependency");
+          SymMI.DependantEDUs.erase(MI.DefiningEDU.get());
+        }
+      }
+
       MI.DefiningEDU = nullptr;
     } else {
       // Otherwise if there are any EDUs waiting on this symbol then move
@@ -3632,6 +3680,8 @@ ExecutionSession::IL_failSymbols(JITDylib &JD,
           ExtractFailedQueries(DepMI);
           DepJD.MaterializingInfos.erase(SymbolStringPtr(DepName));
         }
+
+        DepJD.shrinkMaterializationInfoMemory();
       }
 
       MI.DependantEDUs.clear();
@@ -3644,6 +3694,8 @@ ExecutionSession::IL_failSymbols(JITDylib &JD,
            "Can not delete MaterializingInfo with queries pending");
     JD.MaterializingInfos.erase(Name);
   }
+
+  JD.shrinkMaterializationInfoMemory();
 
 #ifdef EXPENSIVE_CHECKS
   verifySessionState("exiting ExecutionSession::IL_failSymbols");

@@ -18,6 +18,7 @@
 #include "mlir/IR/TypeUtilities.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
+#include "mlir/Interfaces/FunctionInterfaces.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/Support/Debug.h"
 
@@ -193,10 +194,11 @@ FailureOr<Value> bufferization::allocateTensorForShapedValue(
   FailureOr<BaseMemRefType> copyBufferType = getBufferType(tensor, options);
   if (failed(copyBufferType))
     return failure();
-  Attribute memorySpace = copyBufferType->getMemorySpace();
+  std::optional<Attribute> memorySpace = copyBufferType->getMemorySpace();
   if (!memorySpace)
-    memorySpace = b.getI64IntegerAttr(0);
-  allocTensorOp.setMemorySpaceAttr(memorySpace);
+    memorySpace = options.defaultMemorySpaceFn(tensorType);
+  if (memorySpace.has_value())
+    allocTensorOp.setMemorySpaceAttr(memorySpace.value());
   return allocTensorOp.getResult();
 }
 
@@ -313,7 +315,7 @@ namespace {
 /// Default function arg type converter: Use a fully dynamic layout map.
 BaseMemRefType
 defaultFunctionArgTypeConverter(TensorType type, Attribute memorySpace,
-                                func::FuncOp funcOp,
+                                FunctionOpInterface funcOp,
                                 const BufferizationOptions &options) {
   return getMemRefTypeWithFullyDynamicLayout(type, memorySpace);
 }
@@ -360,7 +362,7 @@ BufferizationOptions::dynCastBufferizableOp(Value value) const {
 void BufferizationOptions::setFunctionBoundaryTypeConversion(
     LayoutMapOption layoutMapOption) {
   functionArgTypeConverterFn = [=](TensorType tensorType, Attribute memorySpace,
-                                   func::FuncOp funcOp,
+                                   FunctionOpInterface funcOp,
                                    const BufferizationOptions &options) {
     if (layoutMapOption == LayoutMapOption::IdentityLayoutMap)
       return bufferization::getMemRefTypeWithStaticIdentityLayout(tensorType,
@@ -464,9 +466,8 @@ bool AnalysisState::isValueRead(Value value) const {
 
   while (!workingSet.empty()) {
     OpOperand *uMaybeReading = workingSet.pop_back_val();
-    if (visited.contains(uMaybeReading))
+    if (!visited.insert(uMaybeReading).second)
       continue;
-    visited.insert(uMaybeReading);
 
     // Skip over all ops that neither read nor write (but create an alias).
     if (bufferizesToAliasOnly(*uMaybeReading))
@@ -683,7 +684,7 @@ bufferization::getBufferType(Value value, const BufferizationOptions &options,
 
   // Op is not bufferizable.
   auto memSpace =
-      options.defaultMemorySpaceFn(value.getType().cast<TensorType>());
+      options.defaultMemorySpaceFn(cast<TensorType>(value.getType()));
   if (!memSpace.has_value())
     return op->emitError("could not infer memory space");
 
@@ -938,7 +939,7 @@ FailureOr<BaseMemRefType> bufferization::detail::defaultGetBufferType(
   // If we do not know the memory space and there is no default memory space,
   // report a failure.
   auto memSpace =
-      options.defaultMemorySpaceFn(value.getType().cast<TensorType>());
+      options.defaultMemorySpaceFn(cast<TensorType>(value.getType()));
   if (!memSpace.has_value())
     return op->emitError("could not infer memory space");
 
@@ -986,7 +987,7 @@ bufferization::detail::unknownGetAliasingValues(OpOperand &opOperand) {
   for (Region &region : opOperand.getOwner()->getRegions())
     if (!region.getBlocks().empty())
       for (BlockArgument bbArg : region.getBlocks().front().getArguments())
-        if (bbArg.getType().isa<TensorType>())
+        if (isa<TensorType>(bbArg.getType()))
           r.addAlias({bbArg, BufferRelation::Unknown, /*isDefinite=*/false});
   return r;
 }

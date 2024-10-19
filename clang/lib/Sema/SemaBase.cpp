@@ -1,5 +1,6 @@
 #include "clang/Sema/SemaBase.h"
 #include "clang/Sema/Sema.h"
+#include "clang/Sema/SemaCUDA.h"
 
 namespace clang {
 
@@ -25,7 +26,11 @@ SemaBase::ImmediateDiagBuilder::~ImmediateDiagBuilder() {
   Clear();
 
   // Dispatch to Sema to emit the diagnostic.
-  SemaRef.EmitCurrentDiagnostic(DiagID);
+  SemaRef.EmitDiagnostic(DiagID, *this);
+}
+
+PartialDiagnostic SemaBase::PDiag(unsigned DiagID) {
+  return PartialDiagnostic(DiagID, SemaRef.Context.getDiagAllocator());
 }
 
 const SemaBase::SemaDiagnosticBuilder &
@@ -70,8 +75,8 @@ Sema::SemaDiagnosticBuilder SemaBase::Diag(SourceLocation Loc, unsigned DiagID,
   }
 
   SemaDiagnosticBuilder DB = getLangOpts().CUDAIsDevice
-                                 ? SemaRef.CUDADiagIfDeviceCode(Loc, DiagID)
-                                 : SemaRef.CUDADiagIfHostCode(Loc, DiagID);
+                                 ? SemaRef.CUDA().DiagIfDeviceCode(Loc, DiagID)
+                                 : SemaRef.CUDA().DiagIfHostCode(Loc, DiagID);
   SetIsLastErrorImmediate(DB.isImmediate());
   return DB;
 }

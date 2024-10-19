@@ -79,9 +79,9 @@ void DIBuilder::finalize() {
   // list. Use a set to remove the duplicates while we transform the
   // TrackingVHs back into Values.
   SmallPtrSet<Metadata *, 16> RetainSet;
-  for (unsigned I = 0, E = AllRetainTypes.size(); I < E; I++)
-    if (RetainSet.insert(AllRetainTypes[I]).second)
-      RetainValues.push_back(AllRetainTypes[I]);
+  for (const TrackingMDNodeRef &N : AllRetainTypes)
+    if (RetainSet.insert(N).second)
+      RetainValues.push_back(N);
 
   if (!RetainValues.empty())
     CUNode->replaceRetainedTypes(MDTuple::get(VMContext, RetainValues));
@@ -356,6 +356,17 @@ DIDerivedType *DIBuilder::createTypedef(DIType *Ty, StringRef Name,
                             nullptr, Annotations);
 }
 
+DIDerivedType *
+DIBuilder::createTemplateAlias(DIType *Ty, StringRef Name, DIFile *File,
+                               unsigned LineNo, DIScope *Context,
+                               DINodeArray TParams, uint32_t AlignInBits,
+                               DINode::DIFlags Flags, DINodeArray Annotations) {
+  return DIDerivedType::get(VMContext, dwarf::DW_TAG_template_alias, Name, File,
+                            LineNo, getNonCompileUnitScope(Context), Ty, 0,
+                            AlignInBits, 0, std::nullopt, std::nullopt, Flags,
+                            TParams.get(), Annotations);
+}
+
 DIDerivedType *DIBuilder::createFriend(DIType *Ty, DIType *FriendTy) {
   assert(Ty && "Invalid type!");
   assert(FriendTy && "Invalid friend type!");
@@ -498,7 +509,7 @@ DICompositeType *DIBuilder::createClassType(
          "createClassType should be called with a valid Context");
 
   auto *R = DICompositeType::get(
-      VMContext, dwarf::DW_TAG_structure_type, Name, File, LineNumber,
+      VMContext, dwarf::DW_TAG_class_type, Name, File, LineNumber,
       getNonCompileUnitScope(Context), DerivedFrom, SizeInBits, AlignInBits,
       OffsetInBits, Flags, Elements, RunTimeLang, VTableHolder,
       cast_or_null<MDTuple>(TemplateParams), UniqueIdentifier);
@@ -980,7 +991,7 @@ DbgInstPtr DIBuilder::insertDbgAssign(Instruction *LinkedInstr, Value *Val,
   LLVMContext &Ctx = LinkedInstr->getContext();
   Module *M = LinkedInstr->getModule();
   if (!AssignFn)
-    AssignFn = Intrinsic::getDeclaration(M, Intrinsic::dbg_assign);
+    AssignFn = Intrinsic::getOrInsertDeclaration(M, Intrinsic::dbg_assign);
 
   std::array<Value *, 6> Args = {
       MetadataAsValue::get(Ctx, ValueAsMetadata::get(Val)),
@@ -1049,7 +1060,7 @@ static Value *getDbgIntrinsicValueImpl(LLVMContext &VMContext, Value *V) {
 }
 
 static Function *getDeclareIntrin(Module &M) {
-  return Intrinsic::getDeclaration(&M, Intrinsic::dbg_declare);
+  return Intrinsic::getOrInsertDeclaration(&M, Intrinsic::dbg_declare);
 }
 
 DbgInstPtr DIBuilder::insertDbgValueIntrinsic(
@@ -1063,7 +1074,7 @@ DbgInstPtr DIBuilder::insertDbgValueIntrinsic(
   }
 
   if (!ValueFn)
-    ValueFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_value);
+    ValueFn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::dbg_value);
   return insertDbgIntrinsic(ValueFn, Val, VarInfo, Expr, DL, InsertBB,
                             InsertBefore);
 }
@@ -1164,7 +1175,7 @@ DbgInstPtr DIBuilder::insertLabel(DILabel *LabelInfo, const DILocation *DL,
   }
 
   if (!LabelFn)
-    LabelFn = Intrinsic::getDeclaration(&M, Intrinsic::dbg_label);
+    LabelFn = Intrinsic::getOrInsertDeclaration(&M, Intrinsic::dbg_label);
 
   Value *Args[] = {MetadataAsValue::get(VMContext, LabelInfo)};
 
